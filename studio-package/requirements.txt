@@ -1,0 +1,3 @@
+# ComfyUI supplies torch, its matching Triton build, and safetensors.  Do not
+# upgrade these core packages behind ComfyUI's dependency resolver.
+packaging>=24

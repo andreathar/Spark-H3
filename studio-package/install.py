@@ -1,0 +1,573 @@
+"""Cross-platform installer for the Spark-H3 ComfyUI CUDA backend."""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import platform
+import shutil
+import subprocess
+import sys
+import tempfile
+import urllib.parse
+import urllib.request
+import zipfile
+from importlib import metadata
+from pathlib import Path
+from packaging.version import InvalidVersion, Version
+
+if __package__:
+    from .package_manager import install_command
+else:
+    from package_manager import install_command
+
+SUPPORTED_KITCHEN_IMPLEMENTATIONS = ("0.2.37", "0.2.39")
+DEFAULT_KITCHEN_IMPLEMENTATION = "0.2.37"
+SUPPORTED_ARCHITECTURES = {
+    (8, 6): "sm86",
+    (8, 9): "sm89",
+    (12, 0): "sm120",
+}
+BACKEND_LOCAL_VERSION_PREFIXES = {
+    "sm86": "spark.h3.sm86",
+    "sm89": "spark.h3.sm89",
+    "sm120": "spark.h3.sm120",
+}
+SUPPORTED_RELEASE_CUDA = {(13, 0)}
+DEFAULT_RELEASE_CUDA_TAG = "cu130"
+PACKAGE_BUILD_IDENTITY = "spark_h3_build.json"
+DEFAULT_BACKEND_RELEASE_TAG = "comfyui-v0.2.0"
+RELEASE_API_PREFIX = "https://api.github.com/repos/zechengtang/Spark-H3/releases/tags/"
+
+BACKEND_PROBE = (
+    "from importlib.metadata import version\n"
+    "import sys\n"
+    "import spark_h3_kitchen as kitchen\n"
+    "from spark_h3_kitchen.backends import cuda\n"
+    "installed = version('spark-h3-kitchen')\n"
+    "implementation, _, local = installed.partition('+')\n"
+    "native = getattr(getattr(cuda, '_C', None), 'spark_attn', None)\n"
+    "functions = (cuda.spark_attn, native, kitchen.int8_attention, "
+    "kitchen.prequantize_int8_attention, kitchen.int8_attention_from_prequantized)\n"
+    "available = getattr(kitchen, 'int8_attention_is_available', None)\n"
+    "ok = (all(callable(function) for function in functions) and callable(available) "
+    "and bool(available()) and implementation == sys.argv[1] and local == sys.argv[2])\n"
+    "raise SystemExit(0 if ok else 1)\n"
+)
+
+
+def _cuda_tag(cuda_version: tuple[int, int]) -> str:
+    return f"cu{cuda_version[0]}{cuda_version[1]}"
+
+
+def _backend_local_version(
+    architecture: str,
+    cuda_tag: str = DEFAULT_RELEASE_CUDA_TAG,
+) -> str:
+    return f"{BACKEND_LOCAL_VERSION_PREFIXES[architecture]}.{cuda_tag}.1"
+
+
+def _runtime_platform_tag() -> str:
+    machine = platform.machine().lower()
+    if sys.platform.startswith("linux") and machine in {"x86_64", "amd64"}:
+        return "linux-x86_64"
+    if sys.platform == "win32" and machine in {"x86_64", "amd64"}:
+        return "windows-x86_64"
+    raise RuntimeError(
+        f"unsupported Spark-H3 platform: sys.platform={sys.platform!r}, "
+        f"machine={platform.machine()!r}"
+    )
+
+
+def _node_root() -> Path:
+    here = Path(__file__).resolve().parent
+    return here.parent if (here.parent / "comfyui_backend.py").is_file() else here
+
+
+def _validate_package_identity(
+    root: Path,
+    *,
+    architecture: str,
+    cuda_tag: str,
+    platform_tag: str,
+) -> None:
+    identity_path = root / PACKAGE_BUILD_IDENTITY
+    if not identity_path.is_file():
+        # The repository source tree intentionally has no generated package
+        # identity. A standalone package always includes one.
+        if root == Path(__file__).resolve().parent:
+            raise RuntimeError(
+                f"standalone package build identity is missing: {identity_path}"
+            )
+        return
+    try:
+        identity = json.loads(identity_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as error:
+        raise RuntimeError(f"cannot read package build identity {identity_path}") from error
+    if identity.get("distribution") == "registry":
+        supported = {
+            "architecture": identity.get("architectures", []),
+            "platform": identity.get("platforms", []),
+        }
+        if architecture not in supported["architecture"]:
+            raise RuntimeError(
+                f"Spark-H3 Registry package does not support {architecture}"
+            )
+        if platform_tag not in supported["platform"]:
+            raise RuntimeError(
+                f"Spark-H3 Registry package does not support {platform_tag}"
+            )
+        if identity.get("cuda_tag") != cuda_tag:
+            raise RuntimeError(
+                "Spark-H3 Registry package CUDA identity mismatch: "
+                f"{identity.get('cuda_tag')!r} (expected {cuda_tag!r})"
+            )
+    else:
+        expected = {
+            "architecture": architecture,
+            "cuda_tag": cuda_tag,
+            "platform": platform_tag,
+        }
+        mismatches = {
+            key: (identity.get(key), value)
+            for key, value in expected.items()
+            if identity.get(key) != value
+        }
+        if mismatches:
+            details = ", ".join(
+                f"{key}={found!r} (expected {wanted!r})"
+                for key, (found, wanted) in mismatches.items()
+            )
+            raise RuntimeError(f"Spark-H3 package identity mismatch: {details}")
+    listed_wheels = identity.get("kernel_wheels")
+    if not isinstance(listed_wheels, list) or not all(
+        isinstance(name, str) for name in listed_wheels
+    ):
+        raise RuntimeError("Spark-H3 package identity has an invalid kernel_wheels list")
+    actual_wheels = sorted(
+        wheel.name for wheel in (root / "wheelhouse").glob("*.whl")
+    )
+    if sorted(listed_wheels) != actual_wheels:
+        raise RuntimeError(
+            "Spark-H3 package wheelhouse does not match its build identity: "
+            f"listed={sorted(listed_wheels)!r}, actual={actual_wheels!r}"
+        )
+
+
+def _requirements(root: Path) -> Path | None:
+    candidates = (
+        root / "requirements.txt",
+        root / "comfyui" / "standalone" / "requirements.txt",
+    )
+    return next((path for path in candidates if path.is_file()), None)
+
+
+def _installed_kitchen_version() -> str | None:
+    try:
+        return metadata.version("comfy-kitchen")
+    except metadata.PackageNotFoundError:
+        return None
+
+
+def _is_legacy_spark_kitchen(version: str | None) -> bool:
+    """Return whether ``comfy-kitchen`` is an old Spark-H3 replacement wheel."""
+    if version is None:
+        return False
+    try:
+        local = Version(version).local
+    except InvalidVersion:
+        return False
+    return local is not None and local.startswith("spark.h3.")
+
+
+def _resolve_kitchen_implementation(requested: str | None = None) -> str:
+    """Resolve the isolated implementation independently of the host package."""
+    implementation = requested or DEFAULT_KITCHEN_IMPLEMENTATION
+    if implementation not in SUPPORTED_KITCHEN_IMPLEMENTATIONS:
+        raise RuntimeError(
+            f"unsupported spark-h3-kitchen implementation {implementation!r}; "
+            f"expected one of {SUPPORTED_KITCHEN_IMPLEMENTATIONS}"
+        )
+    return implementation
+
+
+def _backend_available(
+    kitchen_implementation: str,
+    architecture: str = "sm120",
+    cuda_tag: str = DEFAULT_RELEASE_CUDA_TAG,
+) -> bool:
+    """Probe the backend in a fresh interpreter.
+
+    The installer may replace an older spark-h3-kitchen wheel in place. Probing
+    in this process would leave that old package in ``sys.modules``, causing
+    the post-install check to inspect stale Python and native-extension module
+    objects even though pip has already updated the files on disk.
+    """
+    try:
+        result = subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                BACKEND_PROBE,
+                kitchen_implementation,
+                _backend_local_version(architecture, cuda_tag),
+            ],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+        )
+    except OSError:
+        return False
+    return result.returncode == 0
+
+
+def _cuda_capability() -> tuple[int, int]:
+    import torch
+
+    if not torch.cuda.is_available():
+        raise RuntimeError("Spark-H3 installation requires an available NVIDIA CUDA GPU")
+    return tuple(torch.cuda.get_device_capability())
+
+
+def _validate_runtime() -> tuple[int, int]:
+    try:
+        import torch
+        import triton  # noqa: F401
+    except ImportError as error:
+        raise RuntimeError(
+            "Spark-H3 requires the torch-compatible Triton build supplied by "
+            "your ComfyUI environment. Install that build before this node; do "
+            "not replace ComfyUI's torch package with a generic dependency."
+        ) from error
+    cuda_text = torch.version.cuda
+    if cuda_text is None:
+        raise RuntimeError("Spark-H3 requires a CUDA-enabled PyTorch build")
+    try:
+        cuda_version = tuple(int(part) for part in cuda_text.split(".")[:2])
+    except ValueError as error:
+        raise RuntimeError(f"cannot parse PyTorch CUDA version {cuda_text!r}") from error
+    if cuda_version < (13, 0):
+        raise RuntimeError(
+            f"Spark-H3 requires PyTorch CUDA 13.0 or newer; found {cuda_text}"
+        )
+    elif cuda_version not in SUPPORTED_RELEASE_CUDA:
+        print(
+            f"[Spark-H3] PyTorch CUDA {cuda_text} is newer than the cu130 wheel target; "
+            "installation will try the wheel and verify its native entry point.",
+            file=sys.stderr, flush=True,
+        )
+    return cuda_version
+
+
+def _install(specification: str, *, force: bool = False) -> None:
+    command = install_command(sys.executable)
+    if force:
+        command.extend(("--force-reinstall", "--no-deps"))
+    command.append(specification)
+    print(f"[Spark-H3] {' '.join(command)}", flush=True)
+    subprocess.run(command, check=True)
+
+
+def _restore_legacy_kitchen() -> bool:
+    """Replace an old Spark-patched official distribution with its clean release."""
+    installed = _installed_kitchen_version()
+    if not _is_legacy_spark_kitchen(installed):
+        return False
+    assert installed is not None
+    try:
+        base = str(Version(installed).public)
+    except InvalidVersion as error:
+        raise RuntimeError(
+            f"cannot restore legacy comfy-kitchen with invalid version {installed!r}"
+        ) from error
+    print(
+        f"[Spark-H3] detected legacy comfy-kitchen replacement {installed}; "
+        f"restoring official comfy-kitchen {base} before installing the isolated backend.",
+        flush=True,
+    )
+    _install(f"comfy-kitchen=={base}", force=True)
+    restored = _installed_kitchen_version()
+    restored_base = restored.partition("+")[0] if restored is not None else None
+    if restored_base != base or _is_legacy_spark_kitchen(restored):
+        raise RuntimeError(
+            "failed to restore the official comfy-kitchen distribution: "
+            f"expected {base!r} without a Spark-H3 local version, found {restored!r}"
+        )
+    print(
+        f"[Spark-H3] restored official comfy-kitchen {restored}; "
+        "continuing with spark-h3-kitchen installation.",
+        flush=True,
+    )
+    return True
+
+
+def _wheel_metadata(filename: str):
+    from packaging.tags import sys_tags
+    from packaging.utils import parse_wheel_filename
+    try:
+        name = Path(urllib.parse.unquote(urllib.parse.urlparse(filename).path)).name
+        distribution, version, _, tags = parse_wheel_filename(name)
+    except ValueError:
+        return None, None, set(), set()
+    return distribution, str(version), set(tags), set(sys_tags())
+
+
+def _wheel_matches(
+    filename: str,
+    kitchen_implementation: str,
+    architecture: str = "sm120",
+    cuda_tag: str = DEFAULT_RELEASE_CUDA_TAG,
+) -> bool:
+    distribution, version, wheel_tags, supported = _wheel_metadata(filename)
+    expected = f"{kitchen_implementation}+{_backend_local_version(architecture, cuda_tag)}"
+    return (
+        distribution == "spark-h3-kitchen"
+        and version is not None
+        and version == expected
+        and bool(wheel_tags & supported)
+    )
+
+
+def _matching_local_wheel(
+    root: Path,
+    kitchen_implementation: str,
+    architecture: str = "sm120",
+    cuda_tag: str = DEFAULT_RELEASE_CUDA_TAG,
+) -> Path | None:
+    candidates = sorted((root / "wheelhouse").glob("*.whl"))
+    for wheel in candidates:
+        if _wheel_matches(wheel.name, kitchen_implementation, architecture, cuda_tag):
+            return wheel
+    return None
+
+
+def _matching_release_wheel(
+    api_url: str,
+    kitchen_implementation: str,
+    architecture: str = "sm120",
+    cuda_tag: str = DEFAULT_RELEASE_CUDA_TAG,
+) -> str | None:
+    request = urllib.request.Request(
+        api_url,
+        headers={"Accept": "application/vnd.github+json", "User-Agent": "ComfyUI-Spark-H3"},
+    )
+    with urllib.request.urlopen(request, timeout=20) as response:
+        release = json.load(response)
+    for asset in release.get("assets", ()):
+        name = asset.get("name", "")
+        if _wheel_matches(name, kitchen_implementation, architecture, cuda_tag):
+            return asset.get("browser_download_url")
+    platform_tag = _runtime_platform_tag()
+    archive_suffix = f"-{platform_tag}-{architecture}-{cuda_tag}.zip"
+    for asset in release.get("assets", ()):
+        if asset.get("name", "").endswith(archive_suffix):
+            return asset.get("browser_download_url")
+    return None
+
+
+def _install_release_asset(
+    url: str, kitchen_implementation: str, architecture: str, cuda_tag: str
+) -> None:
+    if not urllib.parse.urlparse(url).path.endswith(".zip"):
+        _install(url, force=True)
+        return
+    with tempfile.TemporaryDirectory(prefix="spark-h3-kitchen-") as temporary:
+        archive_path = Path(temporary) / "release.zip"
+        request = urllib.request.Request(url, headers={"User-Agent": "ComfyUI-Spark-H3"})
+        with urllib.request.urlopen(request, timeout=120) as response:
+            with archive_path.open("wb") as destination:
+                shutil.copyfileobj(response, destination)
+        with zipfile.ZipFile(archive_path) as archive:
+            matches = [
+                name for name in archive.namelist()
+                if _wheel_matches(
+                    Path(name).name, kitchen_implementation, architecture, cuda_tag
+                )
+            ]
+            if len(matches) != 1:
+                raise RuntimeError(
+                    f"expected one matching spark-h3-kitchen wheel in {url}, found {len(matches)}"
+                )
+            wheel = Path(temporary) / Path(matches[0]).name
+            wheel.write_bytes(archive.read(matches[0]))
+        _install(str(wheel), force=True)
+
+
+def _install_requirements(root: Path) -> None:
+    requirements = _requirements(root)
+    if requirements is not None:
+        _install(f"-r{requirements}")
+
+
+def _validate_backend(
+    kitchen_implementation: str,
+    architecture: str = "sm120",
+    cuda_tag: str = DEFAULT_RELEASE_CUDA_TAG,
+) -> None:
+    if not _backend_available(kitchen_implementation, architecture, cuda_tag):
+        raise RuntimeError(
+            f"installation finished, but spark-h3-kitchen "
+            f"{kitchen_implementation}+{_backend_local_version(architecture, cuda_tag)} "
+            "does not provide both Spark CUDA and Kitchen INT8 attention"
+        )
+    print(f"[Spark-H3] {architecture.upper()} {cuda_tag.upper()} backend is ready.")
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--wheel", help="local path or URL of a spark-h3-kitchen wheel")
+    parser.add_argument("--source", action="store_true", help="skip wheel discovery and build source")
+    parser.add_argument(
+        "--no-source-fallback",
+        action="store_true",
+        help="fail if a compatible wheel is unavailable",
+    )
+    parser.add_argument("--skip-dependencies", action="store_true")
+    parser.add_argument(
+        "--kitchen-implementation",
+        choices=SUPPORTED_KITCHEN_IMPLEMENTATIONS,
+        help=(
+            "select the isolated spark-h3-kitchen implementation "
+            f"(default: {DEFAULT_KITCHEN_IMPLEMENTATION})"
+        ),
+    )
+    parser.add_argument(
+        "--kitchen-base",
+        dest="deprecated_host_kitchen",
+        help=argparse.SUPPRESS,
+    )
+    parser.add_argument(
+        "--release-api",
+        default=os.environ.get("SPARK_H3_KERNEL_RELEASE_API"),
+    )
+    args = parser.parse_args(argv)
+    if args.deprecated_host_kitchen is not None:
+        print(
+            "[Spark-H3] WARNING: --kitchen-base is deprecated and ignored; "
+            "the official comfy-kitchen package is managed only by ComfyUI. "
+            "Use --kitchen-implementation to select the isolated Spark backend.",
+            file=sys.stderr,
+            flush=True,
+        )
+    root = _node_root()
+    if not args.skip_dependencies:
+        _install_requirements(root)
+    cuda_version = _validate_runtime()
+    runtime_cuda_tag = _cuda_tag(cuda_version)
+    platform_tag = _runtime_platform_tag()
+    newer_cuda = cuda_version > (13, 0)
+    requested_wheel = args.wheel or os.environ.get("SPARK_H3_KERNEL_WHEEL")
+    capability = _cuda_capability()
+    print(f"[Spark-H3] detected GPU architecture: SM{capability[0]}{capability[1]}", flush=True)
+    architecture = SUPPORTED_ARCHITECTURES.get(capability)
+    if architecture is None:
+        raise RuntimeError(
+            f"this ComfyUI package supports SM86, SM89, and SM120, found "
+            f"SM{capability[0]}{capability[1]}"
+        )
+    kitchen_implementation = _resolve_kitchen_implementation(
+        args.kitchen_implementation
+    )
+    cuda_tag = runtime_cuda_tag
+    if requested_wheel is not None and not args.source:
+        candidate_tags = (runtime_cuda_tag, DEFAULT_RELEASE_CUDA_TAG) if newer_cuda else (runtime_cuda_tag,)
+        cuda_tag = next(
+            (tag for tag in candidate_tags
+             if _wheel_matches(
+                 requested_wheel, kitchen_implementation, architecture, tag
+             )),
+            "",
+        )
+        if not cuda_tag:
+            raise RuntimeError(
+                f"wheel {requested_wheel!r} does not match spark-h3-kitchen "
+                f"{kitchen_implementation} "
+                f"for {architecture.upper()}, CUDA {runtime_cuda_tag} or this Python platform"
+            )
+    elif newer_cuda and not args.source:
+        cuda_tag = DEFAULT_RELEASE_CUDA_TAG
+    _validate_package_identity(
+        root,
+        architecture=architecture,
+        cuda_tag=cuda_tag,
+        platform_tag=platform_tag,
+    )
+    print(
+        f"[Spark-H3] isolated kitchen implementation: {kitchen_implementation}; "
+        f"kernel architecture: {architecture.upper()}; CUDA tag: {cuda_tag}; "
+        f"PyTorch CUDA: {cuda_version[0]}.{cuda_version[1]}; "
+        f"platform: {platform_tag}",
+        flush=True,
+    )
+    _restore_legacy_kitchen()
+    if cuda_tag != runtime_cuda_tag:
+        print(
+            f"[Spark-H3] using the {cuda_tag} wheel on PyTorch CUDA "
+            f"{cuda_version[0]}.{cuda_version[1]}; the post-install probe will "
+            "verify its native entry points.",
+            file=sys.stderr, flush=True,
+        )
+    if (
+        _backend_available(kitchen_implementation, architecture, cuda_tag)
+        and not requested_wheel
+        and not args.source
+    ):
+        print("[Spark-H3] compatible spark-h3-kitchen backend is already installed.")
+        return 0
+
+    wheel = requested_wheel
+    if wheel is None and not args.source:
+        local = _matching_local_wheel(
+            root, kitchen_implementation, architecture, cuda_tag
+        )
+        wheel = str(local) if local is not None else None
+    if wheel is None and not args.source:
+        identity_path = root / PACKAGE_BUILD_IDENTITY
+        identity = json.loads(identity_path.read_text(encoding="utf-8")) if identity_path.is_file() else {}
+        release_tag = identity.get("backend_release_tag", DEFAULT_BACKEND_RELEASE_TAG)
+        release_api = args.release_api or RELEASE_API_PREFIX + release_tag
+        try:
+            wheel = _matching_release_wheel(
+                release_api, kitchen_implementation, architecture, cuda_tag
+            )
+        except (OSError, ValueError) as error:
+            print(f"[Spark-H3] release-wheel lookup failed: {error}", file=sys.stderr)
+    if wheel is not None:
+        if wheel == requested_wheel or Path(wheel).is_file():
+            _install(wheel, force=True)
+        else:
+            _install_release_asset(
+                wheel, kitchen_implementation, architecture, cuda_tag
+            )
+        _validate_backend(kitchen_implementation, architecture, cuda_tag)
+        return 0
+    if args.no_source_fallback:
+        raise RuntimeError("no compatible Spark-H3 kernel wheel is available")
+    if newer_cuda and not args.source:
+        raise RuntimeError(
+            f"no {cuda_tag} wheel was found for {architecture.upper()} and spark-h3-kitchen "
+            f"{kitchen_implementation}; provide a matching wheel with --wheel"
+        )
+
+    print("[Spark-H3] no compatible wheel found; compiling the pinned source backend.")
+    try:
+        from .kernel_builder import install_from_source
+    except ImportError:
+        from kernel_builder import install_from_source
+    install_from_source(
+        root,
+        kitchen_implementation=kitchen_implementation,
+        architecture=architecture,
+        cuda_tag=cuda_tag,
+        cuda_archs=None,
+        source_url=os.environ.get(
+            "SPARK_COMFY_KITCHEN_SOURCE",
+            "https://github.com/Comfy-Org/comfy-kitchen.git",
+        ),
+    )
+    _validate_backend(kitchen_implementation, architecture, cuda_tag)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

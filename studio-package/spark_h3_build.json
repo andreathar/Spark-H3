@@ -1,0 +1,16 @@
+{
+  "architectures": [
+    "sm120",
+    "sm86",
+    "sm89"
+  ],
+  "backend_release_tag": "comfyui-v0.2.0",
+  "backend_source": "github-release",
+  "cuda_tag": "cu130",
+  "distribution": "registry",
+  "kernel_wheels": [],
+  "platforms": [
+    "linux-x86_64",
+    "windows-x86_64"
+  ]
+}
